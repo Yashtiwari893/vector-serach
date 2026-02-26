@@ -634,6 +634,62 @@ exports.getCategoryByUser = async (req, res) => {
 // };
 
 // Old
+// -----------------------------------------------------------------------------
+// new chatbot-style semantic search
+// -----------------------------------------------------------------------------
+exports.chatbotSearch = async (req, res) => {
+  try {
+    const { query, phone } = req.body;
+
+    // input validation
+    if (!query || typeof query !== 'string' || !query.trim()) {
+      return responseManager.onBadRequest('Query text required', res);
+    }
+
+    const primary = mongoConnection.useDb(constants.DEFAULT_DB);
+    const User = primary.model(constants.MODELS.user, userModel);
+
+    // generate vector for incoming text
+    const queryVec = await main(query);
+    if (!Array.isArray(queryVec) || queryVec.length === 0) {
+      // embedding failure, treat as server error
+      return responseManager.internalServer(new Error('Embedding generation failed'), res);
+    }
+
+    // build aggregation pipeline for vector search
+    const pipeline = [
+      {
+        $vectorSearch: {
+          index: constants.VECTOR_INDEX,
+          path: 'bio_vector',               // field containing stored embeddings
+          queryVector: queryVec,
+          numCandidates: 50,
+          limit: 5,                        // return top 5 documents
+          // apply phone exclusion inside the vector search stage when provided
+          ...(phone ? { filter: { phone: { $ne: phone } } } : {})
+        }
+      },
+      { $addFields: { score: { $meta: 'vectorSearchScore' } } },
+      { $project: { name: 1, company_name: 1, phone: 1, category: 1, bio: 1, score: 1 } }
+    ];
+
+    const results = await User.aggregate(pipeline);
+    if (!results || results.length === 0) {
+      // return success with empty list per requirement
+      return responseManager.onSuccess('No matching profiles found', [], res);
+    }
+
+    return responseManager.onSuccess('Search results', results, res);
+  } catch (error) {
+    console.error('chatbotSearch error:', error);
+    return responseManager.internalServer(error, res);
+  }
+};
+
+
+// -----------------------------------------------------------------------------
+// existing recommendation handler follows
+// -----------------------------------------------------------------------------
 exports.getRecommendations = async (req, res) => {
   const { userId } = req.body;
   const primary = mongoConnection.useDb(constants.DEFAULT_DB);
