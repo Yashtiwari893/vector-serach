@@ -672,11 +672,11 @@ exports.chatbotSearch = async (req, res) => {
       { $project: { name: 1, company_name: 1, phone: 1, category: 1, bio: 1, link1: 1, score: 1 } }
     ];
 
-    // Execute aggregation with increased timeout (30 seconds)
-    const results = await User.aggregate(pipeline)
-      .maxTimeMS(30000)
-      .allowDiskUse(true)
-      .exec();
+    // Execute aggregation with options
+    const results = await User.aggregate(pipeline, { 
+      maxTimeMS: 30000,
+      allowDiskUse: true 
+    });
 
     if (!results || results.length === 0) {
       // return success with empty list per requirement
