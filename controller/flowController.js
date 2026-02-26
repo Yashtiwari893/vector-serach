@@ -658,6 +658,12 @@ exports.chatbotSearch = async (req, res) => {
 
     // build aggregation pipeline for vector search
     const pipeline = [
+      // Filter documents to ensure bio_vector exists and is not null
+      {
+        $match: {
+          bio_vector: { $exists: true, $ne: null }
+        }
+      },
       {
         $vectorSearch: {
           index: constants.VECTOR_INDEX,
@@ -670,7 +676,7 @@ exports.chatbotSearch = async (req, res) => {
         }
       },
       { $addFields: { score: { $meta: 'vectorSearchScore' } } },
-      { $project: { name: 1, company_name: 1, phone: 1, category: 1, bio: 1, score: 1 } }
+      { $project: { name: 1, company_name: 1, phone: 1, category: 1, bio: 1, link1: 1, score: 1 } }
     ];
 
     const results = await User.aggregate(pipeline);
