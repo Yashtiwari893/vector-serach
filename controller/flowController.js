@@ -672,7 +672,12 @@ exports.chatbotSearch = async (req, res) => {
       { $project: { name: 1, company_name: 1, phone: 1, category: 1, bio: 1, link1: 1, score: 1 } }
     ];
 
-    const results = await User.aggregate(pipeline);
+    // Execute aggregation with increased timeout (30 seconds)
+    const results = await User.aggregate(pipeline)
+      .maxTimeMS(30000)
+      .allowDiskUse(true)
+      .exec();
+
     if (!results || results.length === 0) {
       // return success with empty list per requirement
       return responseManager.onSuccess('No matching profiles found', [], res);
