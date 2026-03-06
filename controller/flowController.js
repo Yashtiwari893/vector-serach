@@ -1305,8 +1305,10 @@ exports.getConnectionStatus = async (req, res) => {
  * Agar 200 nahi aaya, 11za baar baar retry karega.
  */
 exports.templateWebhook = async (req, res) => {
-  // ✅ Pehle 200 OK bhejo — 11za retry nahi karega
-  res.status(200).json({ received: true });
+  // ⚠️  VERCEL SERVERLESS FIX:
+  // Vercel mein res.send() ke baad function TERMINATE ho jaata hai.
+  // Isliye pehle poora kaam karo — DB update + templates bhejo —
+  // phir response bhejo. 11za 5-10s wait kar sakta hai.
 
   try {
     const body = req.body;
@@ -1315,7 +1317,7 @@ exports.templateWebhook = async (req, res) => {
     // Sirf button tap events handle karo
     if (body?.event !== 'MoMessage::Postback') {
       console.log('[Webhook] Ignoring event:', body?.event);
-      return;
+      return res.status(200).json({ received: true, skipped: true });
     }
 
     const payload   = body?.postback?.data || '';
@@ -1336,25 +1338,25 @@ exports.templateWebhook = async (req, res) => {
 
       if (!mongoose.Types.ObjectId.isValid(requestId)) {
         console.error('[Webhook] Invalid requestId in ACCEPT payload:', requestId);
-        return;
+        return res.status(200).json({ received: true, error: 'invalid_request_id' });
       }
 
       const request = await ConnectionRequest.findById(requestId).lean();
       if (!request) {
         console.error('[Webhook] Connection request not found:', requestId);
-        return;
+        return res.status(200).json({ received: true, error: 'request_not_found' });
       }
       if (request.status !== 'pending') {
-        console.log('[Webhook] Request already processed, status:', request.status);
-        return;
+        console.log('[Webhook] Already processed, status:', request.status);
+        return res.status(200).json({ received: true, status: request.status });
       }
 
-      // Status → accepted, acceptedAt set karo
+      // Status → accepted
       await ConnectionRequest.findByIdAndUpdate(requestId, {
         $set: { status: 'accepted', acceptedAt: new Date() }
       });
 
-      // Dono users ka full data fetch karo
+      // Dono users ka data fetch karo
       const [userA, userB] = await Promise.all([
         User.findOne({ phone: request.senderPhone })
             .select('name phone company_name bio link1').lean(),
@@ -1367,7 +1369,7 @@ exports.templateWebhook = async (req, res) => {
       const userAName  = userA?.name  || '';
       const userBName  = userB?.name  || '';
 
-      // Dono ko ivy_match_confirmed bhejo — parallel
+      // Dono ko ivy_match_confirmed bhejo — sab kuch await karo
       const results = await Promise.allSettled([
         // → User A ko (Chat Now → User B)
         send11zaTemplate({
@@ -1375,12 +1377,12 @@ exports.templateWebhook = async (req, res) => {
           name:         userAName,
           templateName: 'ivy_match_confirmed',
           data: [
-            userAName,                        // VARIABLE_1 → "Great news, {{1}}!"
-            userBName,                        // VARIABLE_2 → "connected with {{2}}"
-            userBName,                        // VARIABLE_3 → "Name: {{3}}"
-            formatPhoneFor11za(userBPhone)    // VARIABLE_4 → "Phone: {{4}}"
+            userAName,
+            userBName,
+            userBName,
+            formatPhoneFor11za(userBPhone)
           ],
-          buttonValue: formatPhoneFor11za(userBPhone)  // Chat Now → wa.me/userBPhone
+          buttonValue: formatPhoneFor11za(userBPhone)
         }),
         // → User B ko (Chat Now → User A)
         send11zaTemplate({
@@ -1388,12 +1390,12 @@ exports.templateWebhook = async (req, res) => {
           name:         userBName,
           templateName: 'ivy_match_confirmed',
           data: [
-            userBName,                        // VARIABLE_1 → "Great news, {{1}}!"
-            userAName,                        // VARIABLE_2 → "connected with {{2}}"
-            userAName,                        // VARIABLE_3 → "Name: {{3}}"
-            formatPhoneFor11za(userAPhone)    // VARIABLE_4 → "Phone: {{4}}"
+            userBName,
+            userAName,
+            userAName,
+            formatPhoneFor11za(userAPhone)
           ],
-          buttonValue: formatPhoneFor11za(userAPhone)  // Chat Now → wa.me/userAPhone
+          buttonValue: formatPhoneFor11za(userAPhone)
         })
       ]);
 
@@ -1404,7 +1406,15 @@ exports.templateWebhook = async (req, res) => {
         }
       });
 
-      console.log(`[Webhook] ✅ Match confirmed: ${userAName} (${userAPhone}) ↔ ${userBName} (${userBPhone})`);
+      console.log(`[Webhook] ✅ Match confirmed: ${userAName} ↔ ${userBName}`);
+
+      // ✅ Sab kaam ho gaya — ab response bhejo
+      return res.status(200).json({
+        received: true,
+        action:   'accepted',
+        userA:    { name: userAName, phone: userAPhone },
+        userB:    { name: userBName, phone: userBPhone }
+      });
     }
 
     // ── CANCEL ──────────────────────────────────────────────────────────────
@@ -1413,17 +1423,15 @@ exports.templateWebhook = async (req, res) => {
 
       if (!mongoose.Types.ObjectId.isValid(requestId)) {
         console.error('[Webhook] Invalid requestId in CANCEL payload:', requestId);
-        return;
+        return res.status(200).json({ received: true, error: 'invalid_request_id' });
       }
 
       const request = await ConnectionRequest.findById(requestId).lean();
       if (!request) {
-        console.error('[Webhook] Request not found for cancel:', requestId);
-        return;
+        return res.status(200).json({ received: true, error: 'request_not_found' });
       }
       if (request.status !== 'pending') {
-        console.log('[Webhook] Cancel ignored — already processed:', request.status);
-        return;
+        return res.status(200).json({ received: true, status: request.status });
       }
 
       // Status → rejected
@@ -1433,18 +1441,27 @@ exports.templateWebhook = async (req, res) => {
 
       console.log('[Webhook] ❌ Request cancelled:', requestId);
 
-      // Optional: User A ko notify karo (ivy_request_declined template agar registered ho)
+      // Optional: User A ko notify karo
       if (request.senderPhone) {
-        send11zaTemplate({
+        await send11zaTemplate({
           sendto:       formatPhoneFor11za(request.senderPhone),
           name:         '',
           templateName: 'ivy_request_declined',
           data:         []
-        }).catch(e => console.log('[Webhook] Cancel notify skipped (template may not exist):', e.message));
+        }).catch(e => console.log('[Webhook] Cancel notify skipped:', e.message));
       }
+
+      // ✅ Sab kaam ho gaya — ab response bhejo
+      return res.status(200).json({ received: true, action: 'cancelled' });
     }
+
+    // Unknown payload
+    return res.status(200).json({ received: true, skipped: true, payload });
 
   } catch (error) {
     console.error('[Webhook] Unhandled error:', error);
+    // 200 hi bhejo — 11za ko retry nahi karwana
+    return res.status(200).json({ received: true, error: 'internal_error' });
   }
 };
+
