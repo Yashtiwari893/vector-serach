@@ -654,36 +654,56 @@ exports.chatbotSearch = async (req, res) => {
   try {
     const { query, phone, excludeIds } = req.body;
 
-    // input validation
     if (!query || typeof query !== 'string' || !query.trim()) {
       return responseManager.onBadRequest('Query text required', res);
     }
 
     const primary = mongoConnection.useDb(constants.DEFAULT_DB);
     const User = primary.model(constants.MODELS.user, userModel);
+    const ConnectionRequest = primary.model(constants.MODELS.connectionRequest, connectionRequestModel);
 
-    // generate vector for incoming text
     const queryVec = await main(query);
     if (!Array.isArray(queryVec) || queryVec.length === 0) {
-      // embedding failure, treat as server error
       return responseManager.internalServer(new Error('Embedding generation failed'), res);
     }
 
-    // Build excludeIds filter — convert valid strings to ObjectId, skip invalid ones
+    // ── Layer 1: Frontend seenIds ───────────────────────────────────────────────
     const excludeObjectIds = Array.isArray(excludeIds)
       ? excludeIds
+          .flatMap(id => String(id).split(','))
+          .map(id => id.trim())
           .filter(id => mongoose.Types.ObjectId.isValid(id))
           .map(id => new mongoose.Types.ObjectId(id))
       : [];
 
-    // Build $match stage to exclude self (by phone) and excludeIds
-    const matchConditions = {};
-    if (phone) matchConditions.phone = { $ne: phone };
-    if (excludeObjectIds.length > 0) {
-      matchConditions._id = { $nin: excludeObjectIds };
+    // ── Layer 2: Sent connection requests ──────────────────────────────────────
+    let sentUserIds = [];
+    if (phone) {
+      const sentRequests = await ConnectionRequest.find({
+        senderPhone: phone.toString().trim(),
+        status: { $in: ['pending', 'accepted'] }
+      }).select('receiverPhone').lean();
+
+      const sentPhones = sentRequests.map(r => r.receiverPhone).filter(Boolean);
+      if (sentPhones.length > 0) {
+        const sentUsers = await User.find({ phone: { $in: sentPhones } }).select('_id').lean();
+        sentUserIds = sentUsers.map(u => new mongoose.Types.ObjectId(u._id));
+      }
     }
 
-    // build aggregation pipeline for vector search
+    // ── Merge exclusions ────────────────────────────────────────────────────────
+    const allExcludedSet = new Set([
+      ...excludeObjectIds.map(id => id.toString()),
+      ...sentUserIds.map(id => id.toString())
+    ]);
+    const allExcludedIds = [...allExcludedSet]
+      .filter(id => mongoose.Types.ObjectId.isValid(id))
+      .map(id => new mongoose.Types.ObjectId(id));
+
+    const matchConditions = {};
+    if (phone) matchConditions.phone = { $ne: phone.toString().trim() };
+    if (allExcludedIds.length > 0) matchConditions._id = { $nin: allExcludedIds };
+
     const pipeline = [
       {
         $vectorSearch: {
@@ -691,7 +711,7 @@ exports.chatbotSearch = async (req, res) => {
           path: 'bio_vector',
           queryVector: queryVec,
           numCandidates: 50,
-          limit: 10  // fetch more so post-filter still gives enough results
+          limit: 10
         }
       },
       { $addFields: { score: { $meta: 'vectorSearchScore' } } },
@@ -700,14 +720,9 @@ exports.chatbotSearch = async (req, res) => {
       { $project: { name: 1, company_name: 1, phone: 1, category: 1, bio: 1, link1: 1, score: 1 } }
     ];
 
-    // Execute aggregation with options
-    const results = await User.aggregate(pipeline, { 
-      maxTimeMS: 30000,
-      allowDiskUse: true 
-    });
+    const results = await User.aggregate(pipeline, { maxTimeMS: 30000, allowDiskUse: true });
 
     if (!results || results.length === 0) {
-      // return success with empty list per requirement
       return responseManager.onSuccess('No matching profiles found', [], res);
     }
 
@@ -726,7 +741,8 @@ exports.getRecommendations = async (req, res) => {
   const { userId, excludeIds } = req.body;
   const primary = mongoConnection.useDb(constants.DEFAULT_DB);
   const User = primary.model(constants.MODELS.user, userModel);
-  // Constants
+  const ConnectionRequest = primary.model(constants.MODELS.connectionRequest, connectionRequestModel);
+
   const SIM_THRESHOLD = 0.75;
   const TOP_N = 1;
   const NUM_CANDIDATES = 200;
@@ -734,155 +750,148 @@ exports.getRecommendations = async (req, res) => {
   try {
     const currentUser = await User.findById(userId).lean();
     if (!currentUser) {
-      return res.status(404).json({ message: "User not found" });
+      return res.status(404).json({ message: 'User not found' });
     }
 
     const queryVecRaw = currentUser.bio_vector;
     if (!Array.isArray(queryVecRaw) || queryVecRaw.length === 0) {
-      return res.status(400).json({ message: "Current user does not have a valid bio_vector" });
+      return res.status(400).json({ message: 'User has no valid bio_vector' });
     }
 
-    const queryVec = queryVecRaw.map(v => Number(v));
-
+    const queryVec = queryVecRaw.map(Number);
     const categoryArray = Array.isArray(currentUser.category)
       ? currentUser.category
       : (currentUser.category ? [currentUser.category] : []);
 
-    const shownIds = (currentUser.recommendationsShown || []).map(id => {
-      try { return mongoose.Types.ObjectId(id); } catch (e) { return id; }
-    });
+    // ── Layer 1: DB-tracked shown IDs ──────────────────────────────────────────
+    const shownIds = (currentUser.recommendationsShown || [])
+      .filter(id => mongoose.Types.ObjectId.isValid(id))
+      .map(id => new mongoose.Types.ObjectId(id));
 
-    // Merge DB-tracked shownIds with frontend-provided excludeIds (dedup by string)
+    // ── Layer 2: Frontend seenIds ("id1,id2,id3" string or array) ──────────────
     const extraExcludeIds = Array.isArray(excludeIds)
       ? excludeIds
+          .flatMap(id => String(id).split(','))
+          .map(id => id.trim())
           .filter(id => mongoose.Types.ObjectId.isValid(id))
           .map(id => new mongoose.Types.ObjectId(id))
       : [];
 
-    const allExcludedIds = [
-      ...shownIds,
-      ...extraExcludeIds.filter(
-        exId => !shownIds.some(s => s.toString() === exId.toString())
-      )
-    ];
+    // ── Layer 3: Sent connection requests from DB ───────────────────────────────
+    const sentRequests = await ConnectionRequest.find({
+      senderPhone: currentUser.phone,
+      status: { $in: ['pending', 'accepted'] }
+    }).select('receiverPhone').lean();
+
+    const sentPhones = sentRequests.map(r => r.receiverPhone).filter(Boolean);
+    const sentUsers = sentPhones.length > 0
+      ? await User.find({ phone: { $in: sentPhones } }).select('_id').lean()
+      : [];
+    const sentUserIds = sentUsers.map(u => new mongoose.Types.ObjectId(u._id));
+
+    // ── Merge all exclusions ────────────────────────────────────────────────────
+    const allExcludedSet = new Set([
+      ...shownIds.map(id => id.toString()),
+      ...extraExcludeIds.map(id => id.toString()),
+      ...sentUserIds.map(id => id.toString())
+    ]);
+    const allExcludedIds = [...allExcludedSet]
+      .filter(id => mongoose.Types.ObjectId.isValid(id))
+      .map(id => new mongoose.Types.ObjectId(id));
 
     const userObjectId = new mongoose.Types.ObjectId(userId);
 
-    // Vector search pipeline
-    const pipeline = [
+    console.log(`[Recs] ${currentUser.phone} | shown=${shownIds.length} | sentReqs=${sentUserIds.length} | frontendExclude=${extraExcludeIds.length} | totalExcluded=${allExcludedIds.length}`);
+
+    // ── Pipeline builder ────────────────────────────────────────────────────────
+    const buildPipeline = (excludeList) => [
       {
         $vectorSearch: {
-          index: "vector_index",
-          path: "bio_vector",
+          index: 'vector_index',
+          path: 'bio_vector',
           queryVector: queryVec,
           numCandidates: NUM_CANDIDATES,
           limit: NUM_CANDIDATES,
-          filter: {
-            category: { $in: categoryArray }
-          }
+          filter: { category: { $in: categoryArray } }
         }
       },
-      { $addFields: { vsScore: { $meta: "vectorSearchScore" } } },
+      { $addFields: { vsScore: { $meta: 'vectorSearchScore' } } },
       {
         $match: {
-          $and: [
-            { _id: { $ne: userObjectId } },
-            { _id: { $nin: allExcludedIds } }  // excludes both DB-tracked + frontend-provided IDs
-          ]
+          _id: { $ne: userObjectId },
+          ...(excludeList.length > 0 ? { _id: { $ne: userObjectId, $nin: excludeList } } : {})
         }
       },
       { $project: { name: 1, link1: 1, link2: 1, phone: 1, bio: 1, bio_vector: 1, category: 1, vsScore: 1 } }
     ];
 
-    const candidates = await User.aggregate(pipeline);
-
-    // Cosine similarity helper
+    // ── Cosine similarity ───────────────────────────────────────────────────────
     const cosine = (a, b) => {
       if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) return -1;
       let dot = 0, na = 0, nb = 0;
       for (let i = 0; i < a.length; i++) {
-        const va = Number(a[i]) || 0;
-        const vb = Number(b[i]) || 0;
-        dot += va * vb;
-        na += va * va;
-        nb += vb * vb;
+        const va = Number(a[i]) || 0, vb = Number(b[i]) || 0;
+        dot += va * vb; na += va * va; nb += vb * vb;
       }
-      if (na === 0 || nb === 0) return -1;
-      return dot / (Math.sqrt(na) * Math.sqrt(nb));
+      return (na && nb) ? dot / (Math.sqrt(na) * Math.sqrt(nb)) : -1;
     };
 
-    const withSim = candidates.map(c => {
-      const candVec = Array.isArray(c.bio_vector) ? c.bio_vector.map(Number) : [];
-      const sim = (candVec.length === queryVec.length) ? cosine(queryVec, candVec) : -1;
-      return { ...c, similarity: sim };
-    });
-
-    let filtered = withSim.filter(x => x.similarity >= SIM_THRESHOLD);
-    filtered.sort((a, b) => b.similarity - a.similarity);
-
-    const relaxThresholds = [0.70, 0.65, 0.60];
-    if (filtered.length === 0) {
-      for (const t of relaxThresholds) {
-        filtered = withSim.filter(x => x.similarity >= t);
-        if (filtered.length) break;
+    const scoreAndPick = (candidates) => {
+      const withSim = candidates.map(c => ({
+        ...c,
+        similarity: cosine(queryVec, (c.bio_vector || []).map(Number))
+      }));
+      let filtered = withSim.filter(x => x.similarity >= SIM_THRESHOLD);
+      if (!filtered.length) {
+        for (const t of [0.70, 0.65, 0.60]) {
+          filtered = withSim.filter(x => x.similarity >= t);
+          if (filtered.length) break;
+        }
       }
-    }
+      if (!filtered.length) filtered = withSim; // last resort: any result
+      return filtered.sort((a, b) => b.similarity - a.similarity).slice(0, TOP_N);
+    };
 
-    let recommendations = filtered.slice(0, TOP_N);
+    // ── First attempt with all exclusions ──────────────────────────────────────
+    let candidates = await User.aggregate(buildPipeline(allExcludedIds));
+    let recommendations = scoreAndPick(candidates);
 
-    // Reset if all users shown
+    // ── Reset cycle: DB-shown exhausted → reset recommendationsShown ───────────
+    //    BUT keep excluding sent-request users — they should never re-appear
     if (recommendations.length === 0 && shownIds.length > 0) {
-      await User.findByIdAndUpdate(currentUser._id, { $set: { recommendationsShown: [], searchCount: 0 } });
-
-      const resetPipeline = [
-        {
-          $vectorSearch: {
-            index: "vector_index",
-            path: "bio_vector",
-            queryVector: queryVec,
-            numCandidates: NUM_CANDIDATES,
-            limit: NUM_CANDIDATES,
-            filter: {
-              category: { $in: categoryArray }
-            }
-          }
-        },
-        { $addFields: { vsScore: { $meta: "vectorSearchScore" } } },
-        {
-          $match: { _id: { $ne: userObjectId } }
-        },
-        { $project: { name: 1, link1: 1, link2: 1, phone: 1, bio: 1, bio_vector: 1, category: 1, vsScore: 1 } }
-      ];
-
-      const candidates2 = await User.aggregate(resetPipeline);
-      const withSim2 = candidates2.map(c => {
-        const candVec = Array.isArray(c.bio_vector) ? c.bio_vector.map(Number) : [];
-        const sim = (candVec.length === queryVec.length) ? cosine(queryVec, candVec) : -1;
-        return { ...c, similarity: sim };
+      console.log(`[Recs] Cycle reset for ${currentUser.phone}`);
+      await User.findByIdAndUpdate(currentUser._id, {
+        $set: { recommendationsShown: [], searchCount: 0 }
       });
 
-      withSim2.sort((a, b) => b.similarity - a.similarity);
-      recommendations = withSim2.filter(x => x.similarity >= SIM_THRESHOLD).slice(0, TOP_N);
+      // After reset: only keep sent-request + frontend exclusions
+      const postResetExclude = [
+        ...new Set([
+          ...sentUserIds.map(id => id.toString()),
+          ...extraExcludeIds.map(id => id.toString())
+        ])
+      ]
+        .filter(id => mongoose.Types.ObjectId.isValid(id))
+        .map(id => new mongoose.Types.ObjectId(id));
 
-      if (recommendations.length === 0) {
-        recommendations = withSim2.slice(0, TOP_N);
-      }
+      candidates = await User.aggregate(buildPipeline(postResetExclude));
+      recommendations = scoreAndPick(candidates);
+      console.log(`[Recs] After reset: ${recommendations.length} found`);
     }
 
     if (recommendations.length === 0) {
-      return res.json({ message: "No matching profiles found", recommendations: [] });
+      return res.json({ message: 'No matching profiles found', recommendations: [] });
     }
 
-    // Persist shown recommendations
+    // ── Persist shown IDs to DB ────────────────────────────────────────────────
     const newRecommendedIds = recommendations.map(r => r._id);
     await User.findByIdAndUpdate(currentUser._id, {
       $addToSet: { recommendationsShown: { $each: newRecommendedIds } },
       $inc: { searchCount: 1 }
     });
-    const safeRecommendations = recommendations.map(r => {
-      const { bio_vector, ...rest } = r; // bio_vector remove
-      return rest;
-    });
+
+    const safeRecommendations = recommendations.map(({ bio_vector, ...rest }) => rest);
+
     return res.json({
       recommendations: safeRecommendations,
       totalShown: (currentUser.recommendationsShown || []).length + safeRecommendations.length,
@@ -890,8 +899,8 @@ exports.getRecommendations = async (req, res) => {
     });
 
   } catch (error) {
-    console.error("Error getting recommendations:", error);
-    return res.status(500).json({ message: "Server error", error: error.message });
+    console.error('getRecommendations error:', error);
+    return res.status(500).json({ message: 'Server error', error: error.message });
   }
 };
 
