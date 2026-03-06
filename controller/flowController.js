@@ -972,7 +972,8 @@ exports.sendConnectionRequest = async (req, res) => {
 
     // Verify both users exist
     const [senderUser, receiverUser] = await Promise.all([
-      User.findOne({ phone: senderPhone.trim() }).select("name phone").lean(),
+      // Fetch full profile for both users — company_name, bio, link1 needed for template
+      User.findOne({ phone: senderPhone.trim() }).select("name phone company_name bio link1").lean(),
       User.findOne({ phone: receiverPhone.trim() }).select("name phone").lean()
     ]);
 
@@ -1007,15 +1008,34 @@ exports.sendConnectionRequest = async (req, res) => {
     console.log("Connection request created:", newRequest._id);
 
     // ✅ 11za API se ivy_connection_request template User B (receiver) ko bhejo
-    // Quick Reply button payload = "ACCEPT_<requestId>" — User B tap karega toh
-    // 11za yeh payload capture karega aur acceptConnectionRequest call karega
+    //
+    // Template variables (from screenshot):
+    //   VARIABLE_1 = receiverName   → "Hi {{1}},"
+    //   VARIABLE_2 = senderName     → "{{2}} wants to connect..."
+    //   VARIABLE_3 = senderCompany  → "Company: {{3}}"
+    //   VARIABLE_4 = senderBio      → "About: {{4}}"
+    //   VARIABLE_5 = senderLink     → "Profile: {{5}}"
+    //
+    // Buttons:
+    //   [Accept Request] payload = "ACCEPT_<requestId>"
+    //   [Cancel]         payload = "CANCEL_<requestId>"
     try {
       await send11zaTemplate({
         sendto:       newRequest.receiverPhone,
         name:         receiverUser.name || "",
         templateName: "ivy_connection_request",
-        data:         [senderUser.name || ""],   // {{1}} = senderName
-        buttonValue:  `ACCEPT_${newRequest._id}` // Quick Reply payload
+        data: [
+          receiverUser.name         || "",   // VARIABLE_1 → "Hi {{1}},"
+          senderUser.name           || "",   // VARIABLE_2 → "{{2}} wants to connect"
+          senderUser.company_name   || "",   // VARIABLE_3 → "Company: {{3}}"
+          senderUser.bio            || "",   // VARIABLE_4 → "About: {{4}}"
+          senderUser.link1          || ""    // VARIABLE_5 → "Profile: {{5}}"
+        ],
+        // Multiple Quick Reply buttons — array format
+        buttonValue: [
+          `ACCEPT_${newRequest._id}`,   // Button 1: Accept Request
+          `CANCEL_${newRequest._id}`    // Button 2: Cancel
+        ]
       });
     } catch (templateErr) {
       // Template fail hona request creation ko fail nahi karega
@@ -1053,7 +1073,7 @@ exports.sendConnectionRequest = async (req, res) => {
  */
 exports.acceptConnectionRequest = async (req, res) => {
   try {
-    const { requestId, receiverPhone } = req.body;
+    let { requestId, receiverPhone } = req.body;
 
     if (!requestId || !receiverPhone) {
       return responseManager.onBadRequest(
@@ -1062,9 +1082,27 @@ exports.acceptConnectionRequest = async (req, res) => {
       );
     }
 
+    // ✅ Auto-strip "ACCEPT_" prefix
+    // 11za mein SetVariable: requestId = {{message.text}}
+    // message.text hoga "ACCEPT_683abc..." — backend strip kar dega
+    if (typeof requestId === "string" && requestId.startsWith("ACCEPT_")) {
+      requestId = requestId.replace("ACCEPT_", "").trim();
+    }
+
+    // ✅ Phone normalization
+    // 11za {{recipient.mobileNo_wo_code}} gives "9876543210" (without 91)
+    // DB mein stored hoga "919876543210" (with 91)
+    // Dono cases handle karo
+    receiverPhone = receiverPhone.trim();
+    if (receiverPhone.length === 10) {
+      // No country code — add 91 for India
+      receiverPhone = "91" + receiverPhone;
+    }
+
     if (!mongoose.Types.ObjectId.isValid(requestId)) {
       return responseManager.onBadRequest("Invalid requestId format", res);
     }
+
 
     const primary = mongoConnection.useDb(constants.DEFAULT_DB);
     const ConnectionRequest = primary.model(
@@ -1117,11 +1155,13 @@ exports.acceptConnectionRequest = async (req, res) => {
 
     // ✅ 11za API se ivy_match_confirmed template DONO users ko bhejo
     //
-    // User A ko: Chat Now → wa.me/userB_phone  ({{1}}=userB_name, buttonValue=userB_phone)
-    // User B ko: Chat Now → wa.me/userA_phone  ({{1}}=userA_name, buttonValue=userA_phone)
+    // Template variables (from screenshot):
+    //   VARIABLE_1 = receiverName        → "Great news, {{1}}!"
+    //   VARIABLE_2 = matchedPersonName   → "connected with {{2}}"
+    //   VARIABLE_3 = matchedPersonName   → "Name: {{3}}"
+    //   VARIABLE_4 = matchedPersonPhone  → "Phone: {{4}}"
     //
-    // Note: ivy_match_confirmed template mein URL button ka base: https://wa.me/
-    //       buttonValue = phone number suffix (no + sign)
+    // Button: [Chat Now] → URL = https://wa.me/ + buttonValue (phone number)
     const userAPhone = userA?.phone || request.senderPhone;
     const userBPhone = userB?.phone || request.receiverPhone;
     const userAName  = userA?.name  || "";
@@ -1129,21 +1169,31 @@ exports.acceptConnectionRequest = async (req, res) => {
 
     // Both template sends parallel mein — faster response
     const templateResults = await Promise.allSettled([
-      // → User A ko bhejo (Chat Now → User B se baat karo)
+      // → User A ko bhejo  (Chat Now → User B se baat karo)
       send11zaTemplate({
         sendto:       userAPhone,
         name:         userAName,
         templateName: "ivy_match_confirmed",
-        data:         [userBName],   // {{1}} = User B ka naam
-        buttonValue:  userBPhone     // URL suffix: wa.me/userBPhone
+        data: [
+          userAName,    // VARIABLE_1 → "Great news, {{1}}!"
+          userBName,    // VARIABLE_2 → "connected with {{2}}"
+          userBName,    // VARIABLE_3 → "Name: {{3}}"
+          userBPhone    // VARIABLE_4 → "Phone: {{4}}"
+        ],
+        buttonValue: userBPhone  // Chat Now → wa.me/userBPhone
       }),
-      // → User B ko bhejo (Chat Now → User A se baat karo)
+      // → User B ko bhejo  (Chat Now → User A se baat karo)
       send11zaTemplate({
         sendto:       userBPhone,
         name:         userBName,
         templateName: "ivy_match_confirmed",
-        data:         [userAName],   // {{1}} = User A ka naam
-        buttonValue:  userAPhone     // URL suffix: wa.me/userAPhone
+        data: [
+          userBName,    // VARIABLE_1 → "Great news, {{1}}!"
+          userAName,    // VARIABLE_2 → "connected with {{2}}"
+          userAName,    // VARIABLE_3 → "Name: {{3}}"
+          userAPhone    // VARIABLE_4 → "Phone: {{4}}"
+        ],
+        buttonValue: userAPhone  // Chat Now → wa.me/userAPhone
       })
     ]);
 
