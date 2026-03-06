@@ -37,6 +37,29 @@ async function main(textToEmbed) {
   return embedding
 }
 
+/**
+ * Phone number ko 11za API ke liye format karo.
+ * 11za "sendto" field mein 12-digit number chahiye (91XXXXXXXXXX).
+ *
+ * DB mein phone 10-digit stored hoti hai (mobileNo_wo_code from 11za bot).
+ * Yeh function sirf template bhejne ke liye use karo — DB lookups ke liye nahi.
+ *
+ * Examples:
+ *   "7905470780"       → "917905470780"  (10-digit + 91 prefix)
+ *   "917905470780"     → "917905470780"  (already correct)
+ *   "+917905470780"    → "917905470780"  (+ sign remove)
+ */
+function formatPhoneFor11za(phone) {
+  if (!phone) return phone;
+  const cleaned = phone.toString().replace(/\D/g, ''); // sirf digits rakhne ke liye
+  // Already 12 digit with 91 prefix
+  if (cleaned.startsWith('91') && cleaned.length === 12) return cleaned;
+  // 10 digit Indian number — add 91
+  if (cleaned.length === 10) return '91' + cleaned;
+  // Koi aur format — as-is return karo
+  return cleaned;
+}
+
 async function getEmbedding(text) {
   try {
     const ai = new GoogleGenAI({
@@ -1021,7 +1044,7 @@ exports.sendConnectionRequest = async (req, res) => {
     //   [Cancel]         payload = "CANCEL_<requestId>"
     try {
       await send11zaTemplate({
-        sendto:       newRequest.receiverPhone,
+        sendto:       formatPhoneFor11za(newRequest.receiverPhone), // ← 10→12 digit for 11za API
         name:         receiverUser.name || "",
         templateName: "ivy_connection_request",
         data: [
@@ -1089,15 +1112,11 @@ exports.acceptConnectionRequest = async (req, res) => {
       requestId = requestId.replace("ACCEPT_", "").trim();
     }
 
-    // ✅ Phone normalization
-    // 11za {{recipient.mobileNo_wo_code}} gives "9876543210" (without 91)
-    // DB mein stored hoga "919876543210" (with 91)
-    // Dono cases handle karo
+    // ✅ Phone — sirf trim karo
+    // DB mein 10-digit phone stored hai (11za mobileNo_wo_code se aata hai)
+    // Isliye DB comparison ke liye 91 ADD NAHI karna — as-is match karo
+    // (formatPhoneFor11za sirf template "sendto" field mein use hoga)
     receiverPhone = receiverPhone.trim();
-    if (receiverPhone.length === 10) {
-      // No country code — add 91 for India
-      receiverPhone = "91" + receiverPhone;
-    }
 
     if (!mongoose.Types.ObjectId.isValid(requestId)) {
       return responseManager.onBadRequest("Invalid requestId format", res);
@@ -1171,29 +1190,29 @@ exports.acceptConnectionRequest = async (req, res) => {
     const templateResults = await Promise.allSettled([
       // → User A ko bhejo  (Chat Now → User B se baat karo)
       send11zaTemplate({
-        sendto:       userAPhone,
+        sendto:       formatPhoneFor11za(userAPhone), // ← 10→12 digit for 11za API
         name:         userAName,
         templateName: "ivy_match_confirmed",
         data: [
           userAName,    // VARIABLE_1 → "Great news, {{1}}!"
           userBName,    // VARIABLE_2 → "connected with {{2}}"
           userBName,    // VARIABLE_3 → "Name: {{3}}"
-          userBPhone    // VARIABLE_4 → "Phone: {{4}}"
+          formatPhoneFor11za(userBPhone)  // VARIABLE_4 → "Phone: {{4}}" (12-digit display)
         ],
-        buttonValue: userBPhone  // Chat Now → wa.me/userBPhone
+        buttonValue: formatPhoneFor11za(userBPhone)  // Chat Now → wa.me/userBPhone
       }),
       // → User B ko bhejo  (Chat Now → User A se baat karo)
       send11zaTemplate({
-        sendto:       userBPhone,
+        sendto:       formatPhoneFor11za(userBPhone), // ← 10→12 digit for 11za API
         name:         userBName,
         templateName: "ivy_match_confirmed",
         data: [
           userBName,    // VARIABLE_1 → "Great news, {{1}}!"
           userAName,    // VARIABLE_2 → "connected with {{2}}"
           userAName,    // VARIABLE_3 → "Name: {{3}}"
-          userAPhone    // VARIABLE_4 → "Phone: {{4}}"
+          formatPhoneFor11za(userAPhone)  // VARIABLE_4 → "Phone: {{4}}" (12-digit display)
         ],
-        buttonValue: userAPhone  // Chat Now → wa.me/userAPhone
+        buttonValue: formatPhoneFor11za(userAPhone)  // Chat Now → wa.me/userAPhone
       })
     ]);
 
