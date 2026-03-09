@@ -9,22 +9,6 @@ const axios = require("axios");
 const { GoogleGenAI } = require('@google/genai')
 const mongoose = require("mongoose");
 
-// Temporary endpoint to fix Samman's category if needed
-exports.fixSammanCategory = async (req, res) => {
-  try {
-    const primary = mongoConnection.useDb(constants.DEFAULT_DB);
-    const User = primary.model(constants.MODELS.user, userModel);
-    const samman = await User.findOne({ name: /Samman/i });
-    if (samman) {
-      await User.updateOne({ _id: samman._id }, { $set: { category: ['Startup'] } });
-      return res.json({ message: "Samman updated to Startup", samman });
-    }
-    return res.status(404).json({ message: "Samman not found" });
-  } catch (error) {
-    return res.status(500).json({ error: error.message });
-  }
-};
-
 exports.checkUserProfile = async (req, res) => {
   try {
     const primary = mongoConnection.useDb(constants.DEFAULT_DB);
@@ -820,9 +804,6 @@ exports.getRecommendations = async (req, res) => {
     console.log(`[Recs] ${currentUser.phone} | shown=${shownIds.length} | sentReqs=${sentUserIds.length} | frontendExclude=${extraExcludeIds.length} | totalExcluded=${allExcludedIds.length}`);
 
     // ── Pipeline builder ────────────────────────────────────────────────────────
-    // We filter for SAME category (Startup -> Startup, Investor -> Investor)
-    console.log(`[Recs] Filtering for categories:`, categoryArray);
-    
     const buildPipeline = (excludeList) => [
       {
         $vectorSearch: {
@@ -838,7 +819,7 @@ exports.getRecommendations = async (req, res) => {
       {
         $match: {
           _id: { $ne: userObjectId },
-          ...(excludeList.length > 0 ? { _id: { $nin: excludeList } } : {})
+          ...(excludeList.length > 0 ? { _id: { $ne: userObjectId, $nin: excludeList } } : {})
         }
       },
       { $project: { name: 1, link1: 1, link2: 1, phone: 1, bio: 1, bio_vector: 1, category: 1, vsScore: 1 } }
@@ -873,10 +854,7 @@ exports.getRecommendations = async (req, res) => {
 
     // ── First attempt with all exclusions ──────────────────────────────────────
     let candidates = await User.aggregate(buildPipeline(allExcludedIds));
-    console.log(`[Recs] Vector search found ${candidates.length} raw candidates (post-filter, pre-scoring)`);
-
     let recommendations = scoreAndPick(candidates);
-    console.log(`[Recs] Scored and filtered to ${recommendations.length} final results`);
 
     // ── No results found ────────────────────────────────────────────────────────
     if (recommendations.length === 0) {

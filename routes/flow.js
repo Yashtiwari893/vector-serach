@@ -11,7 +11,6 @@ router.post("/searchByCategory", flowController.searchUserByCategoryAndBio);
 router.post("/getCategoryByUser", flowController.getCategoryByUser);
 router.post("/getRecommendations", flowController.getRecommendations)
 router.post("/chatbotSearch", flowController.chatbotSearch)
-router.get("/fix-samman-category", flowController.fixSammanCategory)
 
 // Connection Request Flow
 router.post("/sendConnectionRequest",  flowController.sendConnectionRequest)
