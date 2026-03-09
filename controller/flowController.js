@@ -875,11 +875,7 @@ exports.getRecommendations = async (req, res) => {
 
     const safeRecommendations = recommendations.map(({ bio_vector, ...rest }) => rest);
 
-    return res.json({
-      recommendations: safeRecommendations,
-      totalShown: (currentUser.recommendationsShown || []).length + safeRecommendations.length,
-      searchCount: (currentUser.searchCount || 0) + 1
-    });
+    return responseManager.onSuccess('Recommendations found', safeRecommendations, res);
 
   } catch (error) {
     console.error('getRecommendations error:', error);
