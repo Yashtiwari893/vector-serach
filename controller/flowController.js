@@ -809,32 +809,28 @@ exports.getRecommendations = async (req, res) => {
     const buildPipeline = (excludeList) => {
       const pipeline = [
         {
-          $vectorSearch: {
-            index: 'vector_index',
-            path: 'bio_vector',
-            queryVector: queryVec,
-            numCandidates: NUM_CANDIDATES,
-            limit: NUM_CANDIDATES
-          }
-        },
-        { $addFields: { vsScore: { $meta: 'vectorSearchScore' } } },
-        {
           $match: {
-            _id: { $ne: userObjectId }
+            _id: { $ne: userObjectId },
+            bio_vector: { $exists: true, $ne: null } // Ensure they have been processed
           }
-        },
-        { $project: { name: 1, link1: 1, link2: 1, phone: 1, bio: 1, bio_vector: 1, category: 1, vsScore: 1 } }
+        }
       ];
 
-      // Add category filter only if user has categories
-      if (categoryArray.length > 0) {
-        pipeline[0].$vectorSearch.filter = { category: { $in: categoryArray } };
+      // Add category filter (Cross-matching: Startup looks for Investor & vice-versa)
+      // If user is Startup, show them Investors. If Investor, show Startups.
+      const oppositeCategory = categoryArray.includes('Startup') ? 'Investor' : (categoryArray.includes('Investor') ? 'Startup' : null);
+      
+      if (oppositeCategory) {
+        pipeline[0].$match.category = oppositeCategory;
       }
 
-      // Add NIN exclusion if list is not empty
+      // Add exclusion NIN
       if (excludeList.length > 0) {
-        pipeline[2].$match._id = { $ne: userObjectId, $nin: excludeList };
+        pipeline[0].$match._id = { $ne: userObjectId, $nin: excludeList };
       }
+
+      pipeline.push({ $project: { name: 1, link1: 1, link2: 1, phone: 1, bio: 1, bio_vector: 1, category: 1 } });
+      pipeline.push({ $limit: NUM_CANDIDATES });
 
       return pipeline;
     };
